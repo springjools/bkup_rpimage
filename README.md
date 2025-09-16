@@ -31,7 +31,7 @@ bkup_rpimage.sh v1.0 by jinx
 ### Options:
 
 * -c creates the SD Image if it does not exist
-* -l writes rsync log to 'sdimage'-YYYYmmddHHMMSS.log
+* -l writes rsync log to [hostname]-yyyy-mm-dd.log
 * -z compresses the SD Image (after backup) to 'sdimage'.gz
 * -d deletes the SD Image after successful compression
 * -f forces overwrite of 'sdimage'.gz if it exists
