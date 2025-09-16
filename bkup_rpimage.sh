@@ -35,14 +35,23 @@
 #
 #
 
-VERSION=v1.2
+VERSION=v1.3
 SDCARD=/dev/mmcblk0
+MOUNTDIR=""
+opt_log=""
+LOG=""
+
+# Define log directory
+LOGDIR="/mnt/triton/backup/rpi/logs"
+
+# Create the directory if it doesn't exist
+mkdir -p "${LOGDIR}"
+
+# Default log file name
+DEFAULT_LOG="${LOGDIR}/$(uname -n)-$(date +%Y-%m-%d).log"
+
 
 setup () {
-    #
-    # Define some fancy colors only if connected to a terminal.
-    # Thus output to file is no more cluttered
-    #
         [ -t 1 ] && {
                 RED=$(tput setaf 1)
                 GREEN=$(tput setaf 2)
@@ -69,19 +78,19 @@ setup () {
         MYNAME=$(basename $0)
 }
 
-
-# Echos traces with yellow text to distinguish from other output
 trace () {
     echo -e "${YELLOW}${1}${NOATT}"
 }
 
-# Echos en error string in red text and exit
+info () {
+    echo -e "${GREEN}${1}${NOATT}"
+}
+
 error () {
     echo -e "${RED}${1}${NOATT}" >&2
     exit 1
 }
 
-# Creates a sparse "${IMAGE}" clone of ${SDCARD} and attaches to ${LOOPBACK}
 do_create () {
     trace "Creating sparse image ${IMAGE} (~$((TOTAL_USED/1024/1024)) MB)"
     dd if=/dev/zero of="${IMAGE}" bs=${BLOCKSIZE} count=0 seek=${SIZE}
@@ -102,11 +111,9 @@ do_create () {
     mkfs.vfat -I ${LOOPBACK}p1
     mkfs.ext4 ${LOOPBACK}p2
 	clone
-
 }
 
 do_cloneid () {
-    # Check if do_create already attached the SD Image
     if [ $(losetup -f) = ${LOOPBACK} ]; then
         trace "Attaching ${IMAGE} to ${LOOPBACK}"
         losetup ${LOOPBACK} "${IMAGE}"
@@ -118,7 +125,6 @@ do_cloneid () {
 }
 
 clone () {
-    # cloning UUID and PARTUUID
     UUID=$(blkid -s UUID -o value ${SDCARD}p2)
     PTUUID=$(blkid -s PTUUID -o value ${SDCARD})
     e2fsck -f -y ${LOOPBACK}p2
@@ -127,9 +133,7 @@ clone () {
     sync
 }
 
-# Mounts the ${IMAGE} to ${LOOPBACK} (if needed) and ${MOUNTDIR}
 do_mount () {
-    # Check if do_create already attached the SD Image
     if [ $(losetup -f) = ${LOOPBACK} ]; then
         trace "Attaching ${IMAGE} to ${LOOPBACK}"
         losetup ${LOOPBACK} "${IMAGE}"
@@ -145,42 +149,54 @@ do_mount () {
     mount ${LOOPBACK}p1 ${MOUNTDIR}/boot
 }
 
-# Rsyncs content of ${SDCARD} to ${IMAGE} if properly mounted
 do_backup () {
-    if mountpoint -q ${MOUNTDIR}; then
-        trace "Starting rsync backup of / and /boot/ to ${MOUNTDIR}"
-
+    if mountpoint -q "${MOUNTDIR}"; then
         START_TIME=$(date +%s)
+        echo "Starting rsync backup of / and /boot/ to ${MOUNTDIR}" | tee -a "${LOG}"
 
+        # Console rsync options (show progress)
+        RSYNC_CONSOLE_OPTS="-aHAXx --delete --info=progress2"
+
+        # Log rsync options (summary only)
+        RSYNC_LOG_OPTS="-aHAXx --delete --stats"
+        [ -n "${opt_log}" ] && RSYNC_LOG_OPTS+=" --log-file=${LOG}"
+
+        # Backup /boot
         if [ -n "${opt_log}" ]; then
-            rsync -ax --del --stats --info=progress2 --log-file=${LOG} /boot/ ${MOUNTDIR}/boot/ 2> >(grep -v "Operation not permitted" >&2)
-            rsync -ax --del --stats --info=progress2 --log-file=${LOG} \
-                --exclude={'tmp/**','proc/**','run/**','sys/**','mnt/**','var/swap','home/pi/.cache/**'} \
-                / ${MOUNTDIR}/ 2> >(grep -v "Operation not permitted" >&2)
+            rsync ${RSYNC_CONSOLE_OPTS} /boot/ "${MOUNTDIR}/boot/" 2> >(grep -v "Operation not permitted" >&2)
+            rsync ${RSYNC_LOG_OPTS} /boot/ "${MOUNTDIR}/boot/" 2> >(grep -v "Operation not permitted" >&2)
         else
-            rsync -ax --del --stats --info=progress2 /boot/ ${MOUNTDIR}/boot/ 2> >(grep -v "Operation not permitted" >&2)
-            rsync -ax --del --stats --info=progress2 \
-                --exclude={'tmp/**','proc/**','run/**','sys/**','mnt/**','var/swap','home/pi/.cache/**'} \
-                / ${MOUNTDIR}/ 2> >(grep -v "Operation not permitted" >&2)
+            rsync ${RSYNC_CONSOLE_OPTS} /boot/ "${MOUNTDIR}/boot/" 2> >(grep -v "Operation not permitted" >&2)
+        fi
+
+        # Backup root filesystem
+        EXCLUDES="--exclude=/boot/* --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* --exclude=/media/* --exclude=/lost+found"
+        if [ -n "${opt_log}" ]; then
+            rsync ${RSYNC_CONSOLE_OPTS} ${EXCLUDES} / "${MOUNTDIR}/" 2> >(grep -v "Operation not permitted" >&2)
+            rsync ${RSYNC_LOG_OPTS} ${EXCLUDES} / "${MOUNTDIR}/" 2> >(grep -v "Operation not permitted" >&2)
+        else
+            rsync ${RSYNC_CONSOLE_OPTS} ${EXCLUDES} / "${MOUNTDIR}/" 2> >(grep -v "Operation not permitted" >&2)
         fi
 
         END_TIME=$(date +%s)
         DURATION=$((END_TIME - START_TIME))
-        trace "Backup finished in $((DURATION/3600))h $(((DURATION/60)%60))m $((DURATION%60))s"
+        SUMMARY="Backup completed: ${MOUNTDIR}
+Duration: $((DURATION/3600))h $(((DURATION/60)%60))m $((DURATION%60))s"
+
+        # Output summary to screen and log
+        echo -e "${SUMMARY}" | tee -a "${LOG}"
 
     else
-        trace "Skipping rsync: ${MOUNTDIR} not mounted"
+        echo "Skipping rsync: ${MOUNTDIR} not mounted" | tee -a "${LOG}"
     fi
 }
 
 do_showdf () {
-
-    echo -n "${GREEN}"
+    echo -n "${CYAN}"
     df -m ${LOOPBACK}p1 ${LOOPBACK}p2
     echo -n "$NOATT"
 }
 
-# Unmounts the ${IMAGE} from ${MOUNTDIR} and ${LOOPBACK}
 do_umount () {
     trace "Flushing to disk"
     sync; sync
@@ -197,7 +213,6 @@ do_umount () {
     losetup -d ${LOOPBACK}
 }
 
-# Compresses ${IMAGE} to ${IMAGE}.gz using a temp file during compression
 do_compress () {
     trace "Compressing ${IMAGE} to ${IMAGE}.gz"
     pv -tpreb "${IMAGE}" | gzip > "${IMAGE}.gz.tmp"
@@ -209,7 +224,6 @@ do_compress () {
     fi
 }
 
-# Tries to cleanup after Ctrl-C interrupt
 ctrl_c () {
     trace "Ctrl-C detected."
 
@@ -226,7 +240,6 @@ ctrl_c () {
     error "SD Image backup process interrupted"
 }
 
-# Prints usage information
 usage () {
     echo -e ""
     echo -e "${MYNAME} ${VERSION} by jinx"
@@ -250,7 +263,7 @@ usage () {
     echo -e "    Options:"
     echo -e ""
     echo -e "        ${BOLD}-c${NOATT}         creates the SD Image if it does not exist"
-    echo -e "        ${BOLD}-l${NOATT}         writes rsync log to 'sdimage'-YYYYmmddHHMMSS.log"
+    echo -e "        ${BOLD}-l${NOATT}         writes rsync log to 'sdimage'-YYYY-MM-DD.log"
     echo -e "        ${BOLD}-z${NOATT}         compresses the SD Image (after backup) to 'sdimage'.gz"
     echo -e "        ${BOLD}-d${NOATT}         deletes the SD Image after successful compression"
     echo -e "        ${BOLD}-f${NOATT}         forces overwrite of 'sdimage'.gz if it exists"
@@ -284,43 +297,41 @@ usage () {
 
 setup
 
-# Read the command from command line
 case ${1} in
     start|mount|umount|gzip|cloneid|showdf)
         opt_command=${1}
         ;;
     -h|--help)
-        usage
-        exit 0
-        ;;
+        usage; exit 0;;
     --version)
-        trace "${MYNAME} ${VERSION} by jinx"
-        exit 0
-        ;;
+        trace "${MYNAME} ${VERSION} by jinx"; exit 0;;
     *)
         error "Invalid command or option: ${1}\nSee '${MYNAME} --help' for usage";;
 esac
 shift 1
 
-# Make sure we have root rights
 if [ $(id -u) -ne 0 ]; then
     error "Please run as root. Try sudo."
 fi
 
-# Default size, can be overwritten by the -s option
 SIZE=$(blockdev --getsz $SDCARD)
 BLOCKSIZE=$(blockdev --getss $SDCARD)
 
-# Read the options from command line
 while getopts ":czdflL:i:s:" opt; do
     case ${opt} in
         c)  opt_create=1;;
         z)  opt_compress=1;;
         d)  opt_delete=1;;
         f)  opt_force=1;;
-        l)  opt_log=1;;
-        L)  opt_log=1
-            LOG=${OPTARG}
+        l)
+            # -l without argument → use default log
+            opt_log=1
+            LOG="${DEFAULT_LOG}"
+            ;;
+        L)
+            # -L logfile → use specified logfile
+            opt_log=1
+            LOG="$OPTARG"
             ;;
         i)  SDCARD=${OPTARG};;
         s)  SIZE=${OPTARG}
@@ -329,76 +340,51 @@ while getopts ":czdflL:i:s:" opt; do
         :)  error "Option -${OPTARG} requires an argument\nSee '${MYNAME} --help' for usage";;
     esac
 done
+
 shift $((OPTIND-1))
 
-# Read the sdimage path from command line
 IMAGE=${1}
-if [ -z "${IMAGE}" ]; then
-    error "No sdimage specified"
-fi
+[ -z "${IMAGE}" ] && error "No sdimage specified"
 
-# Check if sdimage exists
 if [ ${opt_command} = umount ] || [ ${opt_command} = gzip ]; then
-    if [ ! -f "${IMAGE}" ]; then
-        error "${IMAGE} does not exist"
-    fi
+    [ ! -f "${IMAGE}" ] && error "${IMAGE} does not exist"
 else
-    if [ ! -f "${IMAGE}" ] && [ ! -n "${opt_create}" ]; then
-        error "${IMAGE} does not exist\nUse -c to allow creation"
-    fi
+    [ ! -f "${IMAGE}" ] && [ -z "${opt_create}" ] && error "${IMAGE} does not exist\nUse -c to allow creation"
 fi
 
-# Check if we should compress and sdimage.gz exists
 if [ -n "${opt_compress}" ] || [ ${opt_command} = gzip ]; then
-    if [ -s "${IMAGE}".gz ] && [ ! -n "${opt_force}" ]; then
-        error "${IMAGE}.gz already exists\nUse -f to force overwriting"
-    fi
+    [ -s "${IMAGE}".gz ] && [ -z "${opt_force}" ] && error "${IMAGE}.gz already exists\nUse -f to force overwriting"
 fi
 
-# Define default rsync logfile if not defined
-if [ -z ${LOG} ]; then
-    LOG="${IMAGE}-$(date +%Y%m%d%H%M%S).log"
+if [ -n "${opt_log}" ] && [ -z "${LOG}" ]; then
+    LOG="${IMAGE}-$(date +%F).log"
 fi
 
-# Identify which loopback device to use
 LOOPBACK=$(losetup -j "${IMAGE}" | grep -o ^[^:]*)
 if [ ${opt_command} = umount ]; then
-    if [ -z ${LOOPBACK} ]; then
-        error "No /dev/loop<X> attached to ${IMAGE}"
-    fi
+    [ -z ${LOOPBACK} ] && error "No /dev/loop<X> attached to ${IMAGE}"
 elif [ ! -z ${LOOPBACK} ]; then
     error "${IMAGE} already attached to ${LOOPBACK} mounted on $(grep ${LOOPBACK}p2 /etc/mtab | cut -d ' ' -f 2)/"
 else
     LOOPBACK=$(losetup -f)
 fi
 
-
-# Read the optional mountdir from command line
 MOUNTDIR=${2}
 if [ -z ${MOUNTDIR} ]; then
     MOUNTDIR=/mnt/$(basename "${IMAGE}")/
 else
     opt_mountdir=1
-    if [ ! -d ${MOUNTDIR} ]; then
-        error "Mount point ${MOUNTDIR} does not exist"
-    fi
+    [ ! -d ${MOUNTDIR} ] && error "Mount point ${MOUNTDIR} does not exist"
 fi
 
-# Check if default mount point exists
 if [ ${opt_command} = umount ]; then
-    if [ ! -d ${MOUNTDIR} ]; then
-        error "Default mount point ${MOUNTDIR} does not exist"
-    fi
+    [ ! -d ${MOUNTDIR} ] && error "Default mount point ${MOUNTDIR} does not exist"
 else
-    if [ ! -n "${opt_mountdir}" ] && [ -d ${MOUNTDIR} ]; then
-        error "Default mount point ${MOUNTDIR} already exists"
-    fi
+    [ -z "${opt_mountdir}" ] && [ -d ${MOUNTDIR} ] && error "Default mount point ${MOUNTDIR} already exists"
 fi
 
-# Trap keyboard interrupt (ctrl-c)
 trap ctrl_c SIGINT SIGTERM
 
-# Check for dependencies
 for c in dd losetup parted sfdisk partx mkfs.vfat mkfs.ext4 mountpoint rsync; do
     command -v ${c} >/dev/null 2>&1 || error "Required program ${c} is not installed"
 done
@@ -408,10 +394,10 @@ if [ -n "${opt_compress}" ] || [ ${opt_command} = gzip ]; then
     done
 fi
 
-# Do the requested functionality
 case ${opt_command} in
     start)
             trace "Starting SD Image backup process"
+            start_time=$(date +%s)
             if [ ! -f "${IMAGE}" ] && [ -n "${opt_create}" ]; then
                 do_create
             fi
@@ -422,9 +408,12 @@ case ${opt_command} in
             if [ -n "${opt_compress}" ]; then
                 do_compress
             fi
-            trace "Backup completed: ${IMAGE}"
+            end_time=$(date +%s)
+            duration=$(( end_time - start_time ))
+            info "Backup completed: ${IMAGE}"
+            info "Backup took $((duration / 60)) minutes and $((duration % 60)) seconds"
             if [ -n "${opt_log}" ]; then
-                trace "See rsync log in ${LOG}"
+                info "See rsync log in ${LOG}"
             fi
             ;;
     mount)
